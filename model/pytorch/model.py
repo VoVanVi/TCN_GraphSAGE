@@ -343,8 +343,8 @@ class SAGDFNModel(nn.Module, Seq2SeqAttrs):
         self._logger.debug("Encoder complete, starting decoder")
         # print('start decoding')
         outputs = self.decoder(encoder_hidden_state, adj,self.node_index, labels, batches_seen=batches_seen)
-        self.node_index = torch.unsqueeze(self.node_index, 0)
-        self.node_index = torch.repeat_interleave(self.node_index, self.num_nodes, 0)
+        # self.node_index = torch.unsqueeze(self.node_index, 0)
+        # self.node_index = torch.repeat_interleave(self.node_index, self.num_nodes, 0)
         # self._logger.debug("Decoder complete")
         if batches_seen == 0:
             self._logger.info(
