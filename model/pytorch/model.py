@@ -270,7 +270,7 @@ class SAGDFNModel(nn.Module, Seq2SeqAttrs):
 
         return new_node_index
 
-    def forward(self, label, inputs, node_feas, labels=None, batches_seen=None, batch_idx=None):
+    def forward(self, inputs, node_feas, labels=None, batches_seen=None, batch_idx=None):
         """
         :param inputs: shape (seq_len, batch_size, num_sensor * input_dim)
         :param labels: shape (horizon, batch_size, num_sensor * output)
