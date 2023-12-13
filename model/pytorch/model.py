@@ -31,7 +31,7 @@ def softmax_adj_unity(x):
 
 
 def entmax_adj(x):
-    alpha = torch.tensor(1.50, requires_grad=True).to(device)
+    alpha = torch.tensor(1.30, requires_grad=True).to(device)
     x = entmax_bisect(x, alpha)
     shape = x.size()
     _, k = x.data.max(-1)
