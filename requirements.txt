@@ -10,4 +10,4 @@ tensorflow==2.4.1
 torch==1.8.1
 tables==3.6.1
 future==0.18.2
-entmax==1.1
+entmax==1.0
