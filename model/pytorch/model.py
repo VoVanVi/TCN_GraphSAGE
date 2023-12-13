@@ -31,7 +31,7 @@ def softmax_adj_unity(x):
 
 
 def entmax_adj(x):
-    alpha = torch.tensor(1.75, requires_grad=True).to(device)
+    alpha = torch.tensor(1.50, requires_grad=True).to(device)
     x = entmax_bisect(x, alpha)
     shape = x.size()
     _, k = x.data.max(-1)
@@ -162,7 +162,7 @@ class SAGDFNModel(nn.Module, Seq2SeqAttrs):
         self.cl_decay_steps = int(model_kwargs.get('cl_decay_steps', 1000))
         self.use_curriculum_learning = bool(model_kwargs.get('use_curriculum_learning', False))
         self._logger = logger
-        self.num_heads = 1
+        self.num_heads = 4
         self.att_block = [ATTenModel(**model_kwargs) for _ in range(self.num_heads)]
         self.att_fc = torch.nn.Linear(self.num_heads, 1)
         self.att_block = nn.ModuleList(self.att_block)
