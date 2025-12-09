@@ -12,6 +12,8 @@ data:
 model:
   cl_decay_steps: 2000
   filter_type: dual_random_walk
+  aggregation_type: diffusion # set to 'graphsage' to enable GraphSAGE + LSTM aggregation
+  graphsage_neighbors: null   # top-k neighbors per node when aggregation_type is graphsage; try 8-16 for speed or null for all
   horizon: 12
   input_dim: 2
   l1_decay: 0

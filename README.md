@@ -39,3 +39,8 @@ python train.py --config_filename=data/model/para_carpark.yaml
 ```
 
 Hyperparameters can be modified in the `para_la.yaml` and `para_carpark.yaml` files.
+
+### GraphSAGE neighbor sampling
+- By default the model uses diffusion convolutions. To enable GraphSAGE with the learned adaptive adjacency, set `aggregation_type: graphsage` in the `model` section of your config and pick how many neighbors to sample with `graphsage_neighbors`.
+- `graphsage_neighbors` controls the per-node top-K attention neighbors passed to the LSTM aggregator. Use a small K (e.g., 8–16) to keep training fast; set it to `null` to use all learned neighbors (slower but exact) or a larger value if you want more smoothing.
+- No other settings are required; the adaptive adjacency built inside `SAGDFNModel` will be used each timestep when `aggregation_type` is set to `graphsage`.

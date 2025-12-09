@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn as nn
 from lib import utils
 import time
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
@@ -33,7 +34,8 @@ class LayerParams:
 
 class DCGRUCell(torch.nn.Module): # OneStepFastGConv cell use DCRNN DCGRUCell as backbone
     def __init__(self, num_units, max_diffusion_step, num_nodes, nonlinearity='tanh',
-                 filter_type="laplacian", use_gc_for_ru=True):
+                 filter_type="laplacian", use_gc_for_ru=True,
+                 aggregation_type='diffusion', graphsage_neighbors=None):
         """
 
         :param num_units:
@@ -53,6 +55,10 @@ class DCGRUCell(torch.nn.Module): # OneStepFastGConv cell use DCRNN DCGRUCell as
         self._max_diffusion_step = max_diffusion_step
         self._supports = []
         self._use_gc_for_ru = use_gc_for_ru
+        self._aggregation_type = aggregation_type
+        self._graphsage_neighbors = graphsage_neighbors
+        self._cached_graphsage_neighbors = None
+        self._cached_graphsage_source = None
         
         '''
         Option:
@@ -71,6 +77,7 @@ class DCGRUCell(torch.nn.Module): # OneStepFastGConv cell use DCRNN DCGRUCell as
 
         self._fc_params = LayerParams(self, 'fc')
         self._gconv_params = LayerParams(self, 'gconv')
+        self._graphsage_aggregators = {}
 
     @staticmethod
     def _build_sparse_matrix(L):
@@ -98,6 +105,32 @@ class DCGRUCell(torch.nn.Module): # OneStepFastGConv cell use DCRNN DCGRUCell as
         d_mat_inv = torch.diag(d_inv)
         random_walk_mx = torch.mm(d_mat_inv, adj_mx)
         return random_walk_mx
+
+    def _graphsage_neighbors_from_dense(self, adj_mx):
+        if adj_mx.dim() != 2 or adj_mx.shape[0] != adj_mx.shape[1]:
+            self._cached_graphsage_neighbors = None
+            self._cached_graphsage_source = None
+            return None
+
+        cache_key = (adj_mx.data_ptr(), adj_mx._version, adj_mx.shape)
+        if self._cached_graphsage_source == cache_key and self._cached_graphsage_neighbors is not None:
+            return self._cached_graphsage_neighbors
+
+        dense_adj = adj_mx.clone()
+        if dense_adj.shape[0] == self._num_nodes:
+            dense_adj = dense_adj.fill_diagonal_(0.0)
+
+        if self._graphsage_neighbors is None or self._graphsage_neighbors >= dense_adj.shape[1]:
+            neighbor_weights = dense_adj
+            neighbor_index = torch.arange(self._num_nodes, device=device).unsqueeze(0).repeat(self._num_nodes, 1)
+        else:
+            topk = torch.topk(dense_adj, self._graphsage_neighbors, dim=1)
+            neighbor_weights = topk.values
+            neighbor_index = topk.indices
+
+        self._cached_graphsage_source = cache_key
+        self._cached_graphsage_neighbors = (neighbor_index, neighbor_weights)
+        return neighbor_index, neighbor_weights
     
     def _message_passing(self, adj_mx, d_mat_inv, inputs, node_index):
         
@@ -105,6 +138,30 @@ class DCGRUCell(torch.nn.Module): # OneStepFastGConv cell use DCRNN DCGRUCell as
         output = torch.mm(adj_mx, inputs[node_index,:])+torch.mm(d_mat_inv, inputs)
 
         return output
+
+    def _get_graphsage_lstm(self, input_size):
+        if input_size not in self._graphsage_aggregators:
+            lstm = nn.LSTM(input_size, input_size, batch_first=True).to(device)
+            self._graphsage_aggregators[input_size] = lstm
+            self.add_module(f'graphsage_lstm_{input_size}', lstm)
+        return self._graphsage_aggregators[input_size]
+
+    def _graphsage_aggregate(self, features, adj_mx, node_index, input_size):
+        batch_size, num_nodes, feat_dim = features.shape
+        sampled = self._graphsage_neighbors_from_dense(adj_mx)
+        if sampled is None:
+            neighbor_index = node_index
+            neighbor_weights = adj_mx
+        else:
+            neighbor_index, neighbor_weights = sampled
+
+        neighbor_features = features[:, neighbor_index, :]
+        neighbor_features = neighbor_features * neighbor_weights.unsqueeze(0).unsqueeze(-1)
+        lstm_input = neighbor_features.view(batch_size * num_nodes, neighbor_features.size(2), feat_dim)
+        aggregator = self._get_graphsage_lstm(input_size)
+        _, (hidden_state, _) = aggregator(lstm_input)
+        aggregated = hidden_state[-1].view(batch_size, num_nodes, feat_dim)
+        return aggregated
 
     def forward(self, inputs, hx, adj, node_index):
         """Gated recurrent unit (GRU) with Graph Convolution.
@@ -160,57 +217,40 @@ class DCGRUCell(torch.nn.Module): # OneStepFastGConv cell use DCRNN DCGRUCell as
         batch_size = inputs.shape[0]
         inputs = torch.reshape(inputs, (batch_size, self._num_nodes, -1))
         state = torch.reshape(state, (batch_size, self._num_nodes, -1))
-        # print('inputs and state shapes are: ', inputs.shape, state.shape)
         inputs_and_state = torch.cat([inputs, state], dim=2)
-        # print('x_cat shape is :', inputs_and_state.shape)
         input_size = inputs_and_state.size(2)
 
-        x = inputs_and_state
-        x0 = x.permute(1, 2, 0)  # (num_nodes, total_arg_size, batch_size)
-        x0 = torch.reshape(x0, shape=[self._num_nodes, input_size * batch_size])
-        x = torch.unsqueeze(x0, 0)
-        # print('x_cat x and x0 shapes are :', x.shape, x0.shape)
-        if self._max_diffusion_step == 0:
-            pass
+        if self._aggregation_type == 'graphsage':
+            aggregated = self._graphsage_aggregate(inputs_and_state, adj_mx, node_index, input_size)
+            x = torch.cat([inputs_and_state, aggregated], dim=2)
+            x = torch.reshape(x, shape=[batch_size * self._num_nodes, x.size(2)])
+            weights = self._gconv_params.get_weights((x.size(1), output_size))
         else:
-            # print('adj_mx shape is: ', adj_mx.shape)
-            # print('x0 shape is :', x0.shape)
-            if adj_mx.shape[0] == adj_mx.shape[1]:
-                x1 = torch.mm(adj_mx, x0)
-            else:
-                x1 = self._message_passing(adj_mx,d_mat_inv, x0, node_index)
-            # print('x1 shape is :', x1.shape)
-            x = self._concat(x, x1)
-            # print('x shape is :', x.shape)
-
-            for k in range(2, self._max_diffusion_step + 1):
+            x = inputs_and_state
+            x0 = x.permute(1, 2, 0)  # (num_nodes, total_arg_size, batch_size)
+            x0 = torch.reshape(x0, shape=[self._num_nodes, input_size * batch_size])
+            x = torch.unsqueeze(x0, 0)
+            if self._max_diffusion_step != 0:
                 if adj_mx.shape[0] == adj_mx.shape[1]:
-                    x2 = 2 * torch.mm(adj_mx, x1) - x0
+                    x1 = torch.mm(adj_mx, x0)
                 else:
-                    x2 = 2 * self._message_passing(adj_mx, d_mat_inv, x1, node_index) - x0
-                x = self._concat(x, x2)
-                x1, x0 = x2, x1
-            '''
-            Option:
-            for support in self._supports:
-                x1 = torch.sparse.mm(support, x0)
+                    x1 = self._message_passing(adj_mx,d_mat_inv, x0, node_index)
                 x = self._concat(x, x1)
 
                 for k in range(2, self._max_diffusion_step + 1):
-                    x2 = 2 * torch.sparse.mm(support, x1) - x0
+                    if adj_mx.shape[0] == adj_mx.shape[1]:
+                        x2 = 2 * torch.mm(adj_mx, x1) - x0
+                    else:
+                        x2 = 2 * self._message_passing(adj_mx, d_mat_inv, x1, node_index) - x0
                     x = self._concat(x, x2)
                     x1, x0 = x2, x1
-            '''
-        # print('final x before reshape is :', x.shape)
-        num_matrices = self._max_diffusion_step + 1  # Adds for x itself.
-        x = torch.reshape(x, shape=[num_matrices, self._num_nodes, input_size, batch_size])
-        x = x.permute(3, 1, 2, 0)  # (batch_size, num_nodes, input_size, order)
-        x = torch.reshape(x, shape=[batch_size * self._num_nodes, input_size * num_matrices])
-        # print('final x after reshape is :', x.shape)
-        weights = self._gconv_params.get_weights((input_size * num_matrices, output_size))
+            num_matrices = self._max_diffusion_step + 1  # Adds for x itself.
+            x = torch.reshape(x, shape=[num_matrices, self._num_nodes, input_size, batch_size])
+            x = x.permute(3, 1, 2, 0)  # (batch_size, num_nodes, input_size, order)
+            x = torch.reshape(x, shape=[batch_size * self._num_nodes, input_size * num_matrices])
+            weights = self._gconv_params.get_weights((input_size * num_matrices, output_size))
+
         x = torch.matmul(x, weights)  # (batch_size * self._num_nodes, output_size)
-        # print('output size is :', output_size)
         biases = self._gconv_params.get_biases(output_size, bias_start)
         x += biases
-        # Reshape res back to 2D: (batch_size, num_node, state_dim) -> (batch_size, num_node * state_dim)
         return torch.reshape(x, [batch_size, self._num_nodes * output_size])

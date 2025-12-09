@@ -47,6 +47,8 @@ class Seq2SeqAttrs:
         self.max_diffusion_step = int(model_kwargs.get('max_diffusion_step', 2))
         self.cl_decay_steps = int(model_kwargs.get('cl_decay_steps', 1000))
         self.filter_type = model_kwargs.get('filter_type', 'laplacian')
+        self.aggregation_type = model_kwargs.get('aggregation_type', 'diffusion')
+        self.graphsage_neighbors = model_kwargs.get('graphsage_neighbors')
         self.num_nodes = int(model_kwargs.get('num_nodes', 1))
         self.num_rnn_layers = int(model_kwargs.get('num_rnn_layers', 1))
         self.rnn_units = int(model_kwargs.get('rnn_units'))
@@ -62,7 +64,10 @@ class EncoderModel(nn.Module, Seq2SeqAttrs):
         self.seq_len = int(model_kwargs.get('seq_len'))  # for the encoder
         self.dcgru_layers = nn.ModuleList(
             [DCGRUCell(self.rnn_units, self.max_diffusion_step, self.num_nodes,
-                       filter_type=self.filter_type) for _ in range(self.num_rnn_layers)])
+                       filter_type=self.filter_type,
+                       aggregation_type=self.aggregation_type,
+                       graphsage_neighbors=self.graphsage_neighbors)
+             for _ in range(self.num_rnn_layers)])
 
     def forward(self, inputs, adj,node_index, hidden_state=None):
         """
@@ -102,7 +107,10 @@ class DecoderModel(nn.Module, Seq2SeqAttrs):
             self.projection_layer = nn.Linear(self.rnn_units, 12) # 12 is the forecasting length here
         self.dcgru_layers = nn.ModuleList(
             [DCGRUCell(self.rnn_units, self.max_diffusion_step, self.num_nodes,
-                       filter_type=self.filter_type) for _ in range(self.num_rnn_layers)])
+                       filter_type=self.filter_type,
+                       aggregation_type=self.aggregation_type,
+                       graphsage_neighbors=self.graphsage_neighbors)
+             for _ in range(self.num_rnn_layers)])
 
     def forward(self, inputs, adj,node_index, hidden_state=None):
         """
