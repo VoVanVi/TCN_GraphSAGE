@@ -1,4 +1,5 @@
 import torch
+from torch.cuda import amp
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from lib import utils
@@ -7,7 +8,8 @@ from model.pytorch.loss import masked_mae_loss, masked_mape_loss, masked_rmse_lo
 import pandas as pd
 import os
 import time
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class SAGDFNSupervisor:
@@ -18,7 +20,8 @@ class SAGDFNSupervisor:
         self._train_kwargs = kwargs.get('train')
         self.opt = self._train_kwargs.get('optimizer')
         self.max_grad_norm = self._train_kwargs.get('max_grad_norm', 1.)
-        self.threshold = self._model_kwargs.get('threshold', 0.5)  
+        self.use_amp = bool(self._train_kwargs.get('use_amp', False))
+        self.threshold = self._model_kwargs.get('threshold', 0.5)
         self.emb_dim = self._model_kwargs.get('emb_dim')
         self.save_adj_name = save_adj_name
         self.num_sample = self._train_kwargs.get('num_sample')
@@ -33,29 +36,26 @@ class SAGDFNSupervisor:
         self._data = utils.load_dataset(**self._data_kwargs)
         self.standard_scaler = self._data['scaler']
 
-
         # print('Initial, before loading data')
         ### Feas
         if self._data_kwargs['dataset_dir'] == 'data/METR-LA':
-            df = pd.read_hdf('./data/metr-la.h5')
+            df = pd.read_hdf('./data/METR-LA/metr-la.h5')
         elif self._data_kwargs['dataset_dir'] == 'data/PEMS-BAY':
-            df = pd.read_hdf('./data/pems-bay.h5')
+            df = pd.read_hdf('./data/PEMS-BAY/pems-bay.h5')
         elif self._data_kwargs['dataset_dir'] == 'data/CARPARK':
-            df = pd.read_hdf('./data/carpark_05_06.h5')
+            df = pd.read_hdf('./data/CARPARK/carpark_05_06.h5')
         else:
-            df = pd.read_hdf('./data/carpark_05_06.h5')
+            df = pd.read_hdf('./data/CARPARK/carpark_05_06.h5')
         df_s = df
-        max_map = df_s.iloc[:,:].max()
+        max_map = df_s.iloc[:, :].max()
         max_value = max_map.values
         self.max_value = max_value
-
 
         num_samples = df.shape[1]
         # num_train = round(num_samples * 0.7)
         # df = df[:num_train].values
         # np.random.seed(101)
-        df = np.random.rand(num_samples,self.emb_dim) #(# of nodes, embedding dimensions)
-
+        df = np.random.rand(num_samples, self.emb_dim)  # (# of nodes, embedding dimensions)
 
         scaler = utils.StandardScaler(mean=df.mean(), std=df.std())
         train_feas = scaler.transform(df)
@@ -76,6 +76,9 @@ class SAGDFNSupervisor:
             self._model_kwargs.get('use_curriculum_learning', False))
         self.horizon = int(self._model_kwargs.get('horizon', 1))  # for the decoder
 
+        # Ensure the model knows the dimensionality of static node features for projection.
+        self._model_kwargs['node_feat_dim'] = int(self._train_feas.shape[1])
+
 
         # print('Before setup model')
         # setup model
@@ -86,10 +89,10 @@ class SAGDFNSupervisor:
 
         self._epoch_num = self._train_kwargs.get('epoch', 0)
         if self._epoch_num > 0:
-        
             self.load_model()
         # print(self._epoch_num )
         # print('After setup model')
+
     @staticmethod
     def _get_log_dir(kwargs):
         log_dir = kwargs['train'].get('log_dir')
@@ -146,7 +149,8 @@ class SAGDFNSupervisor:
                 x, y = self._prepare_data(x, y)
                 # print(x.shape, y.shape,self._train_feas.shape)
                 output = self.SAGDFN_model(x, self._train_feas)
-                print(x.shape, y.shape,self._train_feas.shape)
+                self._validate_model_output(output)
+                print(x.shape, y.shape, self._train_feas.shape)
                 break
 
     def train(self, **kwargs):
@@ -165,9 +169,9 @@ class SAGDFNSupervisor:
             val_iterator = self._data['{}_loader'.format(dataset)].get_iterator()
             losses = []
             mapes = []
-            #rmses = []
+            # rmses = []
             mses = []
-            
+
             l_3 = []
             m_3 = []
             r_3 = []
@@ -181,17 +185,19 @@ class SAGDFNSupervisor:
             for batch_idx, (x, y) in enumerate(val_iterator):
                 x, y = self._prepare_data(x, y)
 
-                output, mid_output, adj_save = self.SAGDFN_model(x, self._train_feas, y, 100*50, 100*50)
+                # output, mid_output, adj_save = self.SAGDFN_model(x, self._train_feas, y, 100 * 50, 100 * 50)
+                with amp.autocast(enabled=self.use_amp and torch.cuda.is_available()):
+                    model_out = self.SAGDFN_model(x, self._train_feas, y, 100 * 50, 100 * 50)
+                output, mid_output, adj_save = self._validate_model_output(model_out)
 
                 loss = self._compute_loss(y, output, torch.Tensor(self.max_value).to(device))
                 y_true = self.standard_scaler.inverse_transform(y)
                 y_pred = self.standard_scaler.inverse_transform(output)
                 mapes.append(masked_mape_loss(y_pred, y_true).item())
                 mses.append(masked_mse_loss(y_pred, y_true).item())
-                #rmses.append(masked_rmse_loss(y_pred, y_true).item())
+                # rmses.append(masked_rmse_loss(y_pred, y_true).item())
                 losses.append(loss.item())
-                
-                
+
                 # Followed the DCRNN TensorFlow Implementation
                 l_3.append(masked_mae_loss(y_pred[2:3], y_true[2:3]).item())
                 m_3.append(masked_mape_loss(y_pred[2:3], y_true[2:3]).item())
@@ -202,20 +208,17 @@ class SAGDFNSupervisor:
                 l_12.append(masked_mae_loss(y_pred[11:12], y_true[11:12]).item())
                 m_12.append(masked_mape_loss(y_pred[11:12], y_true[11:12]).item())
                 r_12.append(masked_mse_loss(y_pred[11:12], y_true[11:12]).item())
-                    
 
-                
             mean_loss = np.mean(losses)
             mean_mape = np.mean(mapes)
             mean_rmse = np.sqrt(np.mean(mses))
             # mean_rmse = np.mean(rmses) #another option
-            
+
             if dataset == 'test':
-                
                 # Followed the DCRNN PyTorch Implementation
                 message = 'Test: mae: {:.4f}, mape: {:.4f}, rmse: {:.4f}'.format(mean_loss, mean_mape, mean_rmse)
                 self._logger.info(message)
-                
+
                 # Followed the DCRNN TensorFlow Implementation
                 message = 'Horizon 15mins: mae: {:.4f}, mape: {:.4f}, rmse: {:.4f}'.format(np.mean(l_3), np.mean(m_3),
                                                                                            np.sqrt(np.mean(r_3)))
@@ -231,8 +234,6 @@ class SAGDFNSupervisor:
 
             return mean_loss, mean_mape, mean_rmse
 
-
-
     def predict(self, dataset='val', batches_seen=0):
         """
         Computes mean L1Loss
@@ -244,10 +245,9 @@ class SAGDFNSupervisor:
             val_iterator = self._data['{}_loader'.format(dataset)].get_iterator()
             losses = []
             mapes = []
-            #rmses = []
+            # rmses = []
             mses = []
 
-            
             l_3 = []
             m_3 = []
             r_3 = []
@@ -264,19 +264,22 @@ class SAGDFNSupervisor:
             for batch_idx, (x, y) in enumerate(val_iterator):
                 x, y = self._prepare_data(x, y)
 
-                output, mid_output, adj_save = self.SAGDFN_model(x, self._train_feas, y, 100*50, 100*50)
+                with amp.autocast(enabled=self.use_amp and torch.cuda.is_available()):
+                    output, mid_output, adj_save = self.SAGDFN_model(
+                        x, self._train_feas, y, 100 * 50, 100 * 50
+                    )
 
                 loss = self._compute_loss(y, output, torch.Tensor(self.max_value).to(device))
                 y_true = self.standard_scaler.inverse_transform(y)
                 y_pred = self.standard_scaler.inverse_transform(output)
                 mapes.append(masked_mape_loss(y_pred, y_true).item())
                 mses.append(masked_mse_loss(y_pred, y_true).item())
-                #rmses.append(masked_rmse_loss(y_pred, y_true).item())
+                # rmses.append(masked_rmse_loss(y_pred, y_true).item())
                 losses.append(loss.item())
-                
+
                 y_truths.append(y_true.cpu())
                 y_preds.append(y_pred.cpu())
-                
+
                 # Followed the DCRNN TensorFlow Implementation
                 l_3.append(masked_mae_loss(y_pred[2:3], y_true[2:3]).item())
                 m_3.append(masked_mape_loss(y_pred[2:3], y_true[2:3]).item())
@@ -288,10 +291,6 @@ class SAGDFNSupervisor:
                 m_12.append(masked_mape_loss(y_pred[11:12], y_true[11:12]).item())
                 r_12.append(masked_mse_loss(y_pred[11:12], y_true[11:12]).item())
 
-                    
-
-                
-
             # end_time = time.time()
             # message = 'Test consuming time: {:.1f}s'.format(end_time - start_time)
             # self._logger.info(message)
@@ -299,22 +298,21 @@ class SAGDFNSupervisor:
             mean_mape = np.mean(mapes)
             mean_rmse = np.sqrt(np.mean(mses))
             # mean_rmse = np.mean(rmses) #another option
-            
-            y_preds=np.concatenate(y_preds, axis =1)
+
+            y_preds = np.concatenate(y_preds, axis=1)
             y_truths = np.concatenate(y_truths, axis=1)
-            
+
             if dataset in ['test', 'test1', 'test2', 'test3', 'test4']:
 
                 # ### Change the Y_hat and Y dir
                 if self._data_kwargs['dataset_dir'] == 'data/CARPARK':
                     np.savez_compressed('./data/y_preds_carpark.npz', y_preds)
                     np.savez_compressed('./data/y_truths_carpark.npz', y_truths)
-                # # np.savez_compressed('./data/adj_save.npz', adj_save.cpu())
-                    error = y_preds-y_truths
+                    # # np.savez_compressed('./data/adj_save.npz', adj_save.cpu())
+                    error = y_preds - y_truths
 
                     # message = 'Test dateset is {}, shape is {}'.format(dataset, y_preds.shape)
                     # self._logger.info(message)
-
 
                     error_tensor = torch.from_numpy(error)
                     error_ratio = torch.mean(abs(error_tensor), [1]).cpu().numpy()
@@ -323,32 +321,44 @@ class SAGDFNSupervisor:
                     # # df_s = pd.read_hdf('/home/user1/data/carpark/DCRNN/carpark_full_DCRNN_type.h5')
                     # max_map = df_s.iloc[:,:].max()
                     # max_value = max_map.values
-                    error_scaled = error_ratio*self.max_value
-                    a = np.mean(error_scaled,axis=1)
-                    message = 'Test MAE for 15 mins 30 mins 60mins prediction: {:.4f}, {:.4f}, {:.4f}'.format(a[2], a[5], a[11])
+                    error_scaled = error_ratio * self.max_value
+                    a = np.mean(error_scaled, axis=1)
+                    message = 'Test MAE for 15 mins 30 mins 60mins prediction: {:.4f}, {:.4f}, {:.4f}'.format(a[2],
+                                                                                                              a[5],
+                                                                                                              a[11])
                     self._logger.info(message)
                 if self._data_kwargs['dataset_dir'] == 'data/METR-LA':
-                ### Change the Y_hat and Y dir
+                    ### Change the Y_hat and Y dir
                     np.savez_compressed('./data/y_preds_METR.npz', y_preds)
                     np.savez_compressed('./data/y_truths_METR.npz', y_truths)
                 count = 0
-                adj_map = adj_save.cpu()
+                if isinstance(adj_save, dict):
+                    # Prefer local adjacency for edge counting, fallback to any available tensor.
+                    if "local" in adj_save and adj_save["local"] is not None:
+                        adj_map = adj_save["local"]
+                    elif "global" in adj_save and adj_save["global"] is not None:
+                        adj_map = adj_save["global"]
+                    else:
+                        raise RuntimeError("adj_save dict did not contain a valid adjacency tensor.")
+                else:
+                    adj_map = adj_save
+                adj_map = adj_map.cpu()
                 # if adj_map.shape[0] == adj_map.shape[1]:
                 for t in range(adj_map.shape[0]):
                     for k in range(adj_map.shape[1]):
-                        if adj_map[t][k]>self.threshold:
-                            count+=1 
-                # else:
+                        if adj_map[t][k] > self.threshold:
+                            count += 1
+                            # else:
                 #     for t in range(adj_map.shape[0]):
                 #         if adj_map[t][0]>self.threshold:
-                #                 count+=1 
+                #                 count+=1
                 # message = 'Total edges in the final adj matrix: {}'.format(count)
                 # self._logger.info(message)
 
                 # Followed the DCRNN PyTorch Implementation
                 message = 'Test: mae: {:.4f}, mape: {:.4f}, rmse: {:.4f}'.format(mean_loss, mean_mape, mean_rmse)
                 self._logger.info(message)
-                
+
                 # Followed the DCRNN TensorFlow Implementation
                 message = 'Horizon 15mins: mae: {:.4f}, mape: {:.4f}, rmse: {:.4f}'.format(np.mean(l_3), np.mean(m_3),
                                                                                            np.sqrt(np.mean(r_3)))
@@ -364,13 +374,11 @@ class SAGDFNSupervisor:
 
             return mean_loss, mean_mape, mean_rmse
 
-
-
     def _train(self, base_lr,
                steps, patience=200, epochs=100, lr_decay_ratio=0.1, log_every=1, save_model=0,
                test_every_n_epochs=10, epsilon=1e-8, **kwargs):
         # steps is used in learning rate - will see if need to use it?
-        min_val_loss = float('inf')
+        min_val_mae = float('inf')
         wait = 0
         if self.opt == 'adam':
             optimizer = torch.optim.Adam(self.SAGDFN_model.parameters(), lr=base_lr, eps=epsilon)
@@ -392,20 +400,19 @@ class SAGDFNSupervisor:
         loss_hist = []
 
         for epoch_num in range(self._epoch_num, epochs):
-            print("Num of epoch:",epoch_num)
+            print("Num of epoch:", epoch_num)
             self.SAGDFN_model = self.SAGDFN_model.train()
             train_iterator = self._data['train_loader'].get_iterator()
             losses = []
             start_time = time.time()
-
+            iter_data_time = 0.0
+            iter_compute_time = 0.0
+            iter_total_time = 0.0
+            steps_this_epoch = 0
+            scaler = amp.GradScaler(enabled=self.use_amp and torch.cuda.is_available())
+            last_iter_end = start_time
 
             for batch_idx, (x, y) in enumerate(train_iterator):
-                optimizer.zero_grad()
-                x, y = self._prepare_data(x, y)
-                output, mid_output, adj_save = self.SAGDFN_model(x, self._train_feas, y, batches_seen, batch_idx)
-                if (epoch_num % epochs) == epochs - 1:
-                    output, mid_output, adj_save = self.SAGDFN_model(x, self._train_feas, y, batches_seen)
-
                 if batches_seen == 0:
                     if self.opt == 'adam':
                         optimizer = torch.optim.Adam(self.SAGDFN_model.parameters(), lr=base_lr, eps=epsilon)
@@ -414,22 +421,45 @@ class SAGDFNSupervisor:
                     else:
                         optimizer = torch.optim.Adam(self.SAGDFN_model.parameters(), lr=base_lr, eps=epsilon)
 
-                self.SAGDFN_model.to(device)
-                
+                x, y = self._prepare_data(x, y)
+                data_wait = time.time() - last_iter_end
+                compute_start = time.time()
 
+                optimizer.zero_grad(set_to_none=True)
+                with amp.autocast(enabled=scaler.is_enabled()):
+                    model_out = self.SAGDFN_model(x, self._train_feas, y, batches_seen, batch_idx)
+                    output, mid_output, adj_save = self._validate_model_output(model_out)
+                    if (epoch_num % epochs) == epochs - 1:
+                        model_out = self.SAGDFN_model(x, self._train_feas, y, batches_seen)
+                        output, mid_output, adj_save = self._validate_model_output(model_out)
+                    loss = self._compute_loss(y, output, torch.Tensor(self.max_value).to(device))
 
-                loss = self._compute_loss(y, output, torch.Tensor(self.max_value).to(device))
+                if (batch_idx + 1) % 10 == 0 or batch_idx == 0:
+                    self._logger.info(
+                        "Epoch %d batch %d/%d loss=%.4f" % (
+                            epoch_num,
+                            batch_idx + 1,
+                            num_batches,
+                            loss.item(),
+                        )
+                    )
                 losses.append(loss.item())
-                # print('loss shape is: ', loss)
-                
+
                 self._logger.debug(loss.item())
                 batches_seen += 1
-                loss.backward()
 
-                # gradient clipping - this does it in place
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(self.SAGDFN_model.parameters(), self.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
 
-                optimizer.step()
+                compute_dur = time.time() - compute_start
+                iter_compute_time += compute_dur
+                iter_data_time += data_wait
+                iter_total_time += data_wait + compute_dur
+                steps_this_epoch += 1
+                last_iter_end = time.time()
             self._logger.info("epoch complete")
             lr_scheduler.step()
             self._logger.info("evaluating now!")
@@ -437,52 +467,111 @@ class SAGDFNSupervisor:
 
             val_loss, val_mape, val_rmse = self.evaluate(dataset='val', batches_seen=batches_seen)
             end_time2 = time.time()
+            if steps_this_epoch > 0:
+                avg_data_wait = iter_data_time / steps_this_epoch
+                avg_compute = iter_compute_time / steps_this_epoch
+                avg_iter = iter_total_time / steps_this_epoch
+                self._logger.info(
+                    "Timing summary (per batch): data_wait=%.4fs compute=%.4fs total=%.4fs over %d steps"
+                    % (avg_data_wait, avg_compute, avg_iter, steps_this_epoch)
+                )
             self._writer.add_scalar('training loss',
                                     np.mean(losses),
                                     batches_seen)
 
             if (epoch_num % log_every) == log_every - 1:
-                message = 'Epoch [{}/{}] ({}) train_mae: {:.4f}, val_mae: {:.4f}, val_mape: {:.4f}, val_rmse: {:.4f}, lr: {:.6f}, ' \
-                            '{:.1f}s, {:.1f}s'.format(epoch_num, epochs, batches_seen,
-                                                    np.mean(losses), val_loss, val_mape, val_rmse,
-                                                    lr_scheduler.get_lr()[0],
-                                                    (end_time - start_time), (end_time2 - start_time))
+                train_time = end_time - start_time
+                total_time = end_time2 - start_time
+                message = (
+                    'Epoch [{}/{}] ({}) train_mae: {:.4f}, val_mae: {:.4f}, val_mape: {:.4f}, '
+                    'val_rmse: {:.4f}, lr: {:.6f}, {:.1f}s, {:.1f}s'
+                ).format(
+                    epoch_num,
+                    epochs,
+                    batches_seen,
+                    np.mean(losses),
+                    val_loss,
+                    val_mape,
+                    val_rmse,
+                    lr_scheduler.get_last_lr()[0],
+                    train_time,
+                    total_time,
+                )
                 self._logger.info(message)
 
             if (epoch_num % test_every_n_epochs) == test_every_n_epochs - 1:
                 test_loss, test_mape, test_rmse = self.evaluate(dataset='test', batches_seen=batches_seen)
-                message = 'Epoch [{}/{}] ({}) train_mae: {:.4f}, test_mae: {:.4f}, test_mape: {:.4f}, test_rmse: {:.4f}, lr: {:.6f}, ' \
-                            '{:.1f}s, {:.1f}s'.format(epoch_num, epochs, batches_seen,
-                                                    np.mean(losses), test_loss, test_mape, test_rmse,
-                                                    lr_scheduler.get_lr()[0],
-                                                    (end_time - start_time), (end_time2 - start_time))
+                train_time = end_time - start_time
+                total_time = end_time2 - start_time
+                message = (
+                    'Epoch [{}/{}] ({}) train_mae: {:.4f}, test_mae: {:.4f}, test_mape: {:.4f}, '
+                    'test_rmse: {:.4f}, lr: {:.6f}, {:.1f}s, {:.1f}s'
+                ).format(
+                    epoch_num,
+                    epochs,
+                    batches_seen,
+                    np.mean(losses),
+                    test_loss,
+                    test_mape,
+                    test_rmse,
+                    lr_scheduler.get_last_lr()[0],
+                    train_time,
+                    total_time,
+                )
                 self._logger.info(message)
-            
-            if val_loss < min_val_loss:
+
+            if val_loss < min_val_mae:
                 wait = 0
                 if save_model:
                     model_file_name = self.save_model(epoch_num)
                     self._logger.info(
                         'Val loss decrease from {:.4f} to {:.4f}, '
-                        'saving to {}'.format(min_val_loss, val_loss, model_file_name))
-                min_val_loss = val_loss
+                        'saving to {}'.format(min_val_mae, val_loss, model_file_name))
+                min_val_mae = val_loss
 
                 test_loss, test_mape, test_rmse = self.predict(dataset='test', batches_seen=batches_seen)
                 end_time3 = time.time()
-                message = 'Epoch [{}/{}] ({}) train_mae: {:.4f}, test_mae: {:.4f}, test_mape: {:.4f}, test_rmse: {:.4f}, lr: {:.6f}, ' \
-                            'validation time{:.1f}s, testing time{:.1f}s'.format(epoch_num, epochs, batches_seen,
-                                                    np.mean(losses), test_loss, test_mape, test_rmse,
-                                                    lr_scheduler.get_lr()[0],
-                                                    (end_time2 - end_time), (end_time3 - end_time2))
+                message = (
+                    'Epoch [{}/{}] ({}) train_mae: {:.4f}, test_mae: {:.4f}, test_mape: {:.4f}, '
+                    'test_rmse: {:.4f}, lr: {:.6f}, validation time{:.1f}s, testing time{:.1f}s'
+                ).format(
+                    epoch_num,
+                    epochs,
+                    batches_seen,
+                    np.mean(losses),
+                    test_loss,
+                    test_mape,
+                    test_rmse,
+                    lr_scheduler.get_last_lr()[0],
+                    (end_time2 - end_time),
+                    (end_time3 - end_time2),
+                )
                 self._logger.info(message)
-                
-            elif val_loss >= min_val_loss:
+
+            elif val_loss >= min_val_mae:
                 wait += 1
                 if wait == patience:
                     self._logger.warning('Early stopping at epoch: %d' % epoch_num)
                     break
             loss_hist.append(val_loss)
-            np.savez_compressed('./data/loss_hist_full.npz', loss_hist = loss_hist)
+            np.savez_compressed('./data/loss_hist_full.npz', loss_hist=loss_hist)
+
+    def _validate_model_output(self, model_out):
+        """Ensure the model forward returns the expected (output, mid_output, adj_save) tuple."""
+        if model_out is None:
+            raise RuntimeError(
+                "SAGDFNModel.forward returned None; expected (outputs, mid_output, adj_save)."
+            )
+        if not isinstance(model_out, (list, tuple)):
+            raise RuntimeError(
+                f"SAGDFNModel.forward returned type {type(model_out)}, expected a tuple of three tensors."
+            )
+        if len(model_out) != 3:
+            raise RuntimeError(
+                f"SAGDFNModel.forward returned {len(model_out)} items, expected 3 (outputs, mid_output, adj_save)."
+            )
+        return model_out
+
     def _prepare_data(self, x, y):
         x, y = self._get_x_y(x, y)
         x, y = self._get_x_y_in_correct_dims(x, y)
@@ -511,20 +600,22 @@ class SAGDFNSupervisor:
                  y: shape (horizon, batch_size, num_sensor * output_dim)
         """
         batch_size = x.size(1)
-        x = x.view(self.seq_len, batch_size, self.num_nodes * self.input_dim)
-        y = y[..., :self.output_dim].view(self.horizon, batch_size,
-                                          self.num_nodes * self.output_dim)
+        # reshape instead of view to avoid stride issues after permute
+        x = x.reshape(self.seq_len, batch_size, self.num_nodes * self.input_dim)
+        y = y[..., :self.output_dim].reshape(
+            self.horizon, batch_size, self.num_nodes * self.output_dim
+        )
         return x, y
 
     def _compute_loss(self, y_true, y_predicted, max_value):
-        if max_value.shape[0]==1918:
+        if max_value.shape[0] == 1918:
             y_true = self.standard_scaler.inverse_transform(y_true)
-            y_true = y_true*max_value
+            y_true = y_true * max_value
             # print('y_true shape is: ', y_true.shape)
             y_predicted = self.standard_scaler.inverse_transform(y_predicted)
-            y_predicted = y_predicted*max_value
+            y_predicted = y_predicted * max_value
             # print('y_predicted shape is: ', y_predicted.shape)
-            return masked_mae_loss(y_predicted, y_true)/182
+            return masked_mae_loss(y_predicted, y_true) / 182
         else:
             y_true = self.standard_scaler.inverse_transform(y_true)
             y_predicted = self.standard_scaler.inverse_transform(y_predicted)

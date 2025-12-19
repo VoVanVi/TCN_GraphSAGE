@@ -1,362 +1,286 @@
-from sqlalchemy import true
+import math
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-from model.pytorch.cell import DCGRUCell
-import numpy as np
-from entmax import sparsemax, entmax15, entmax_bisect
-from lib import utils
-import time
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def cosine_similarity_torch(x1, x2=None, eps=1e-8):
-    x2 = x1 if x2 is None else x2
-    w1 = x1.norm(p=2, dim=1, keepdim=True)
-    w2 = w1 if x2 is x1 else x2.norm(p=2, dim=1, keepdim=True)
-    return torch.mm(x1, x2.t()) / (w1 * w2.t()).clamp(min=eps)
+from model.pytorch.sage import GraphSAGEEncoder
+from model.pytorch.tcn import TemporalConvNet
 
 
-def softmax_adj_unity(x):
-    x = F.softmax(x/0.5, dim=-1)
-    shape = x.size()
-    _, k = x.data.max(-1)
-    y_hard = torch.zeros(*shape).to(device)
-    y_hard = y_hard.zero_().scatter_(-1, k.view(shape[:-1] + (1,)), 1.0)
-    y = torch.autograd.Variable(y_hard - x.data) + x
-    # y = y_hard - x.data + x
-    return y
+def _init_neighbor_index(num_nodes: int, num_neighbors: int, device: torch.device) -> torch.Tensor:
+    num_neighbors = min(num_neighbors, num_nodes)
+    index = torch.randint(num_nodes, (num_nodes, num_neighbors), device=device)
+    return index
 
 
-def entmax_adj(x):
-    alpha = torch.tensor(1.30, requires_grad=True).to(device)
-    x = entmax_bisect(x, alpha)
-    shape = x.size()
-    _, k = x.data.max(-1)
-    y_hard = torch.zeros(*shape).to(device)
-    y_hard = y_hard.zero_().scatter_(-1, k.view(shape[:-1] + (1,)), 1.0)
-    y = torch.autograd.Variable(y_hard - x.data) + x
-    return y
+def _as_int_list(maybe_list, fallback: List[int]) -> List[int]:
+    if maybe_list is None:
+        return fallback
+    if isinstance(maybe_list, int):
+        return [maybe_list]
+    if isinstance(maybe_list, (list, tuple)):
+        return [int(v) for v in maybe_list]
+    return fallback
 
 
-class Seq2SeqAttrs:
-    def __init__(self, **model_kwargs):
-        #self.adj_mx = adj_mx
-        self.max_diffusion_step = int(model_kwargs.get('max_diffusion_step', 2))
-        self.cl_decay_steps = int(model_kwargs.get('cl_decay_steps', 1000))
-        self.filter_type = model_kwargs.get('filter_type', 'laplacian')
-        self.aggregation_type = model_kwargs.get('aggregation_type', 'diffusion')
-        self.graphsage_neighbors = model_kwargs.get('graphsage_neighbors')
-        self.num_nodes = int(model_kwargs.get('num_nodes', 1))
-        self.num_rnn_layers = int(model_kwargs.get('num_rnn_layers', 1))
-        self.rnn_units = int(model_kwargs.get('rnn_units'))
-        self.hidden_state_size = self.num_nodes * self.rnn_units
-        self.threshold = model_kwargs.get('threshold', 0.5)
+class NodeEmbeddingMLP(nn.Module):
+    """Small MLP for static node features.
+
+    Keeps the naming fc3/fc4/fc5 to mirror legacy SAGDFN implementations.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.fc3 = nn.Linear(in_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc5 = nn.Linear(hidden_dim, out_dim)
+        self.act = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (num_nodes, node_feat_dim)
+        h = self.act(self.fc3(x))
+        h = self.act(self.fc4(h))
+        h = self.fc5(h)
+        return h
 
 
-class EncoderModel(nn.Module, Seq2SeqAttrs):
-    def __init__(self, **model_kwargs):
-        nn.Module.__init__(self)
-        Seq2SeqAttrs.__init__(self, **model_kwargs)
-        self.input_dim = int(model_kwargs.get('input_dim', 1))
-        self.seq_len = int(model_kwargs.get('seq_len'))  # for the encoder
-        self.dcgru_layers = nn.ModuleList(
-            [DCGRUCell(self.rnn_units, self.max_diffusion_step, self.num_nodes,
-                       filter_type=self.filter_type,
-                       aggregation_type=self.aggregation_type,
-                       graphsage_neighbors=self.graphsage_neighbors)
-             for _ in range(self.num_rnn_layers)])
+class SAGDFNModel(nn.Module):
+    """Spatio-temporal forecasting network with TCN + GraphSAGE-LSTM.
 
-    def forward(self, inputs, adj,node_index, hidden_state=None):
-        """
-        Encoder forward pass.
-        :param inputs: shape (batch_size, self.num_nodes * self.input_dim)
-        :param hidden_state: (num_layers, batch_size, self.hidden_state_size)
-               optional, zeros if not provided
-        :return: output: # shape (batch_size, self.hidden_state_size)
-                 hidden_state # shape (num_layers, batch_size, self.hidden_state_size)
-                 (lower indices mean lower layers)
-        """
-        batch_size, _ = inputs.size()
-        if hidden_state is None:
-            hidden_state = torch.zeros((self.num_rnn_layers, batch_size, self.hidden_state_size),
-                                       device=device)
-        hidden_states = []
-        output = inputs
-        for layer_num, dcgru_layer in enumerate(self.dcgru_layers):
-            next_hidden_state = dcgru_layer(output, hidden_state[layer_num], adj,node_index)
-            hidden_states.append(next_hidden_state)
-            output = next_hidden_state
+    Forward contract:
+        inputs: (seq_len, batch_size, num_nodes * input_dim)
+        node_feas: (num_nodes, node_feat_dim)
+        labels: optional, unused for forward but kept for compatibility
+        returns (outputs, mid_output, adj_save) where
+            outputs: (horizon, batch_size, num_nodes * output_dim)
+            mid_output: stacked spatial features (batch, seq_len, num_nodes, hidden_dim)
+            adj_save: learned neighbor weights aligned with node_index (num_nodes, num_neighbors)
+    """
 
-        return output, torch.stack(hidden_states)  # runs in O(num_layers) so not too slow
-
-
-class DecoderModel(nn.Module, Seq2SeqAttrs):
-    def __init__(self, **model_kwargs):
-        # super().__init__(is_training, adj_mx, **model_kwargs)
-        nn.Module.__init__(self)
-        Seq2SeqAttrs.__init__(self, **model_kwargs)
-        self.output_dim = int(model_kwargs.get('output_dim', 1))
-        self.horizon = int(model_kwargs.get('horizon', 1))  # for the decoder
-        self.decoder_type = model_kwargs.get('decoder')
-        if self.decoder_type == 'GRU':
-            self.projection_layer = nn.Linear(self.rnn_units, self.output_dim)
-        else:
-            self.projection_layer = nn.Linear(self.rnn_units, 12) # 12 is the forecasting length here
-        self.dcgru_layers = nn.ModuleList(
-            [DCGRUCell(self.rnn_units, self.max_diffusion_step, self.num_nodes,
-                       filter_type=self.filter_type,
-                       aggregation_type=self.aggregation_type,
-                       graphsage_neighbors=self.graphsage_neighbors)
-             for _ in range(self.num_rnn_layers)])
-
-    def forward(self, inputs, adj,node_index, hidden_state=None):
-        """
-        :param inputs: shape (batch_size, self.num_nodes * self.output_dim)
-        :param hidden_state: (num_layers, batch_size, self.hidden_state_size)
-               optional, zeros if not provided
-        :return: output: # shape (batch_size, self.num_nodes * self.output_dim)
-                 hidden_state # shape (num_layers, batch_size, self.hidden_state_size)
-                 (lower indices mean lower layers)
-        """
-        batch_size, _ = inputs.size()
-        hidden_states = []
-        output = inputs
-        for layer_num, dcgru_layer in enumerate(self.dcgru_layers):
-            next_hidden_state = dcgru_layer(output, hidden_state[layer_num], adj, node_index)
-            hidden_states.append(next_hidden_state)
-            output = next_hidden_state
-        # print('output shape from DecoderModel before projection', output.shape)
-        projected = self.projection_layer(output.view(-1, self.rnn_units))
-        if self.decoder_type == 'GRU':
-            output = projected.view(-1, self.num_nodes * self.output_dim)
-        else:
-        # print('the output size is: ', output.shape)
-            output = projected.view(batch_size, self.num_nodes * self.output_dim, 12) # 12 is the forecasting length here
-            output = torch.transpose(output,0,2)
-            output = torch.transpose(output,1,2)
-
-        return output, torch.stack(hidden_states)
-
-class ATTenModel(nn.Module, Seq2SeqAttrs):
-    def __init__(self, **model_kwargs):
-        # super().__init__(is_training, adj_mx, **model_kwargs)
-        nn.Module.__init__(self)
-        Seq2SeqAttrs.__init__(self, **model_kwargs)
-        self.embedding_dim = 100
-        self.fc_out = nn.Linear(self.embedding_dim * 2, self.embedding_dim)
-        self.fc_cat = nn.Linear(self.embedding_dim, 2)
-        self.fc2 = torch.nn.Linear(2, 1)
-    def forward(self, x):
-        x = torch.relu(self.fc_out(x))
-        x = self.fc_cat(x)
-        adj = entmax_adj(x)
-        
-
-        # np.savez('adj_aft', adj = adj.cpu().detach().numpy())
-        # print('adj shape is: ', adj.shape)
-        adj = self.fc2(adj)
-        return adj
-
-class SAGDFNModel(nn.Module, Seq2SeqAttrs):
     def __init__(self, logger, **model_kwargs):
         super().__init__()
-        Seq2SeqAttrs.__init__(self, **model_kwargs)
-        self.encoder_model = EncoderModel(**model_kwargs)
-        self.decoder_model = DecoderModel(**model_kwargs)
-        self.decoder_type = model_kwargs.get('decoder')
-        self.cl_decay_steps = int(model_kwargs.get('cl_decay_steps', 1000))
-        self.use_curriculum_learning = bool(model_kwargs.get('use_curriculum_learning', False))
         self._logger = logger
-        self.num_heads = 4
-        self.att_block = [ATTenModel(**model_kwargs) for _ in range(self.num_heads)]
-        self.att_fc = torch.nn.Linear(self.num_heads, 1)
-        self.att_block = nn.ModuleList(self.att_block)
-        self.embedding_dim = 100 # precise embedding dimension used in graph learning process
-        self.emb_dim = model_kwargs.get('emb_dim') # randomly initial embedding dimension
-        self.hidden_drop = torch.nn.Dropout(0.2)
-        if self.emb_dim == 200:
-            self.fc3 = torch.nn.Linear(self.emb_dim, self.embedding_dim)
-            self.fc4 = torch.nn.Linear(2, 1)
+        self.num_nodes = int(model_kwargs.get("num_nodes", 1))
+        self.input_dim = int(model_kwargs.get("input_dim", 1))
+        self.seq_len = int(model_kwargs.get("seq_len", 1))
+        self.output_dim = int(model_kwargs.get("output_dim", 1))
+        self.horizon = int(model_kwargs.get("horizon", 1))
+        self.hidden_dim = int(model_kwargs.get("hidden_dim", model_kwargs.get("rnn_units", 64)))
+        self.temporal_backbone = model_kwargs.get("temporal_backbone", "TCN")
+        self.spatial_backbone = model_kwargs.get("spatial_backbone", "SAGE_LSTM")
+        self.node_feat_dim = int(model_kwargs.get("node_feat_dim", model_kwargs.get("emb_dim", self.input_dim)))
+        self.emb_dim = int(model_kwargs.get("emb_dim", self.node_feat_dim))
+        self.num_neighbors = int(model_kwargs.get("neighbor_M", model_kwargs.get("num_neighbors", 10)))
+        self.multi_scale = bool(model_kwargs.get("multi_scale", False))
+        self.use_local = bool(model_kwargs.get("use_local", True))
+        self.use_global = bool(model_kwargs.get("use_global", True))
+        if not (self.use_local or self.use_global):
+            raise ValueError("At least one of use_local or use_global must be True.")
+        self.M_local = int(model_kwargs.get("M_local", max(self.num_neighbors, 1)))
+        self.M_global = int(model_kwargs.get("M_global", self.num_neighbors))
+        self.gate_type = str(model_kwargs.get("gate_type", "scalar")).lower()
+        self.temporal_dropout_p = float(model_kwargs.get("temporal_dropout_p", 0.0))
+        self.node_dropout_p = float(model_kwargs.get("node_dropout_p", 0.0))
+        self.adj_ema_decay = float(model_kwargs.get("adj_ema_decay", 0.99))
+        self.adj_ema_mix = float(model_kwargs.get("adj_ema_mix", 1.0))
+        self.num_sage_layers = int(model_kwargs.get("num_sage_layers", 2))
+        self.tcn_kernel = int(model_kwargs.get("tcn_kernel", 2))
+        self.tcn_dropout = float(model_kwargs.get("tcn_dropout", 0.1))
+        self.sage_dropout = float(model_kwargs.get("sage_dropout", 0.1))
+        tcn_layers = _as_int_list(model_kwargs.get("tcn_layers"), [self.hidden_dim, self.hidden_dim])
+
+        self.input_proj = nn.Linear(self.input_dim, self.hidden_dim)
+        self.node_mlp = NodeEmbeddingMLP(self.node_feat_dim, self.hidden_dim, self.emb_dim)
+        self.node_hidden_proj = nn.Linear(self.emb_dim, self.hidden_dim)
+        self.temporal_net = TemporalConvNet(
+            num_inputs=self.hidden_dim,
+            num_channels=tcn_layers,
+            kernel_size=self.tcn_kernel,
+            dropout=self.tcn_dropout,
+        )
+        self.sage = GraphSAGEEncoder(
+            in_dim=self.hidden_dim,
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_sage_layers,
+            num_neighbors=self.num_neighbors,
+            dropout=self.sage_dropout,
+        )
+        self.att_query = nn.Linear(self.emb_dim, self.hidden_dim, bias=False)
+        self.att_key = nn.Linear(self.emb_dim, self.hidden_dim, bias=False)
+        self.output_head = nn.Linear(self.hidden_dim, self.horizon * self.output_dim)
+        gate_out_dim = 1 if self.gate_type == "scalar" else self.hidden_dim
+        self.gate_mlp = nn.Linear(self.hidden_dim, gate_out_dim)
+        self.res_proj = nn.Identity()
+
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.register_buffer(
+            "node_index",
+            _init_neighbor_index(self.num_nodes, self.num_neighbors, device),
+            persistent=True,
+        )
+        if self.multi_scale:
+            self.register_buffer(
+                "node_index_local",
+                _init_neighbor_index(self.num_nodes, self.M_local, device),
+                persistent=True,
+            )
+            self.register_buffer(
+                "node_index_global",
+                _init_neighbor_index(self.num_nodes, self.M_global, device),
+                persistent=True,
+            )
+            self.register_buffer(
+                "adj_ema_local",
+                torch.zeros(self.num_nodes, self.M_local, device=device),
+                persistent=True,
+            )
+            self.register_buffer(
+                "adj_ema_global",
+                torch.zeros(self.num_nodes, self.M_global, device=device),
+                persistent=True,
+            )
         else:
-            self.fc3 = torch.nn.Linear(self.emb_dim, 1000)
-            self.fc4 = torch.nn.Linear(1000, 500)
-            self.fc5 = torch.nn.Linear(500, self.embedding_dim)
+            self.register_buffer("adj_ema_local", torch.zeros(1, 1, device=device), persistent=True)
+            self.register_buffer("adj_ema_global", torch.zeros(1, 1, device=device), persistent=True)
 
-        self.bn3 = torch.nn.BatchNorm1d(self.embedding_dim)
-        self.fc_out = nn.Linear(self.embedding_dim * 2, self.embedding_dim)
-        self.fc_cat = nn.Linear(self.embedding_dim, 2)
-        self.sigmoid = nn.Sigmoid()
+    def _reshape_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (seq_len, batch, num_nodes * input_dim)
+        seq_len, batch, _ = inputs.shape
+        x = inputs.permute(1, 0, 2).contiguous()  # (batch, seq_len, num_nodes * input_dim)
+        x = x.reshape(batch, seq_len, self.num_nodes, self.input_dim)
+        return x
 
-        ### For sparse implementation
-        self.node_lib = torch.ones(self.num_nodes)
-        self.neigb = 100
-        self.sub = 20
-        self.node_index = torch.multinomial(self.node_lib , self.num_nodes*self.neigb, replacement = True)
-        self.node_index = torch.reshape(self.node_index, (self.num_nodes, self.neigb))
-        
+    def _compute_attention(self, node_embed: torch.Tensor, neighbor_index: torch.Tensor) -> torch.Tensor:
+        """Compute slim adjacency weights with attention.
 
-
-    def _compute_sampling_threshold(self, batches_seen):
-        return self.cl_decay_steps / (
-                self.cl_decay_steps + np.exp(batches_seen / self.cl_decay_steps))
-
-    def encoder(self, inputs, adj, node_index):
+        Args:
+            node_embed: (num_nodes, emb_dim)
+            neighbor_index: (num_nodes, num_neighbors)
+        Returns:
+            weights: (num_nodes, num_neighbors) rows sum to 1.
         """
-        Encoder forward pass
-        :param inputs: shape (seq_len, batch_size, num_sensor * input_dim)
-        :return: encoder_hidden_state: (num_layers, batch_size, self.hidden_state_size)
-        """
-        encoder_hidden_state = None
-        for t in range(self.encoder_model.seq_len):
-            _, encoder_hidden_state = self.encoder_model(inputs[t], adj, node_index, encoder_hidden_state) 
-        # print('encoder model shape from cell, ', encoder_hidden_state.shape)
-        return encoder_hidden_state
+        neighbor_embed = node_embed[neighbor_index]  # (num_nodes, num_neighbors, emb_dim)
+        query = self.att_query(node_embed)  # (num_nodes, hidden_dim)
+        key = self.att_key(neighbor_embed)  # (num_nodes, num_neighbors, hidden_dim)
+        scores = (query.unsqueeze(1) * key).sum(-1) / math.sqrt(self.hidden_dim)
+        weights = torch.softmax(scores, dim=1)
+        return weights
 
-    def decoder(self, encoder_hidden_state, adj, node_index, labels=None, batches_seen=None):
-        """
-        Decoder forward pass
-        :param encoder_hidden_state: (num_layers, batch_size, self.hidden_state_size)
-        :param labels: (self.horizon, batch_size, self.num_nodes * self.output_dim) [optional, not exist for inference]
-        :param batches_seen: global step [optional, not exist for inference]
-        :return: output: (self.horizon, batch_size, self.num_nodes * self.output_dim)
-        """
-        batch_size = encoder_hidden_state.size(1)
-        go_symbol = torch.zeros((batch_size, self.num_nodes * self.decoder_model.output_dim),
-                                device=device)
-        decoder_hidden_state = encoder_hidden_state
-        decoder_input = go_symbol
-
-        outputs = []
-        if self.decoder_type == 'GRU':
-            for t in range(self.decoder_model.horizon):
-                decoder_output, decoder_hidden_state = self.decoder_model(decoder_input, adj,node_index,
-                                                                        decoder_hidden_state)
-                decoder_input = decoder_output
-                outputs.append(decoder_output)
-                if self.training and self.use_curriculum_learning:
-                    c = np.random.uniform(0, 1)
-                    if c < self._compute_sampling_threshold(batches_seen):
-                        decoder_input = labels[t]
-            outputs = torch.stack(outputs)
-            return outputs
-        else:
-            decoder_output, decoder_hidden_state = self.decoder_model(decoder_input, adj,node_index,
-                                                                        decoder_hidden_state)
-            return decoder_output
-
-
-    def filter_neigb(self, x, node_index, sub):
-        senders = []
-        # start_time = time.time()
-        for t in range(x.size(0)):
-            senders.append(x[node_index[t,:],:])
-        # end_time1 = time.time()
-        # print('Time to build sender for comparison is: ', end_time1 - start_time)
-        senders = torch.stack(senders) # senders shape:(N, k, d)
-        x_copy = x.clone().detach()
-        x_copy = torch.unsqueeze(x_copy, 1)
-        difference = (senders - x_copy)*(senders-x_copy)
-        difference = torch.sum(difference, 2)
-        sorted_node, indices = torch.sort(difference)
-        del senders, x_copy, sorted_node, difference
-        new_node_index = []
-        # start_time = time.time()
-        for t in range(x.size(0)):
-            new_node_index.append(node_index[t, indices[t,:-sub]])
-        new_node_index = torch.stack(new_node_index)
-
-        ### count the top K elements in the new node index
-        unique, counts = torch.unique(new_node_index, return_counts = True)
-        sorted, indices = torch.sort(counts, descending=True)
-        new_node_index = torch.gather(unique, 0, indices)[:self.neigb-sub]
-        new_node_index = torch.unsqueeze(new_node_index, 0)
-        sub_index = torch.randint(self.num_nodes, (1,sub))
-        new_node_index = torch.squeeze(torch.cat((new_node_index, sub_index), 1), 0) 
-
-        return new_node_index
-
-    def forward(self, inputs, node_feas, labels=None, batches_seen=None, batch_idx=None):
-        """
-        :param inputs: shape (seq_len, batch_size, num_sensor * input_dim)
-        :param labels: shape (horizon, batch_size, num_sensor * output)
-        :param batches_seen: batches seen till now
-        :return: output: (self.horizon, batch_size, self.num_nodes * self.output_dim)
-        """
-        # print(node_feas.shape)
-        x = node_feas.view(self.num_nodes, -1)
-        if self.emb_dim == 200:
-            x = self.fc3(x)
-            x = F.relu(x)
-            x = x.view(self.num_nodes, -1)
-        else: # initial embedding dimension 2000, if change, need modify here
-            x = self.fc3(x)
-            x = F.relu(x)
-            x = self.fc4(x)
-            x = F.relu(x)
-            x = self.fc5(x)
-            x = F.relu(x)
-
-        x = self.bn3(x)        ### node embedding: (N, d)      
-        
-        ### filtering function applied here
-        if self.num_nodes < 1600: # no need filtering for graph less than 1600 nodes as GPU should be able to handle this, also can DIY upon your device
-            receivers = torch.repeat_interleave(x, x.shape[0], axis=0)
-            senders = torch.tile(x, (x.shape[0], 1))
-        else:
-            if batch_idx < 100 and batches_seen <50:
-                # self._logger.info("Current num_batches:{}".format(batch_idx))
-                self.node_index = self.filter_neigb(x, self.node_index, self.sub)
-            else:
-                self.node_index = self.node_index[0,:]
-            senders = []
-            # start_time = time.time()
-            for t in range(x.size(0)):
-                senders.append(x[self.node_index,:])
-            senders = torch.stack(senders)
-            # end_time1 = time.time()
-            # print('Time to build sender is: ', end_time1 - start_time)
-            senders = torch.reshape(senders, (self.num_nodes*self.neigb, -1))
-            receivers = torch.repeat_interleave(x, self.neigb, axis=0)
-        
-        x = torch.cat([senders, receivers], dim=1)
-        # print('X shape is: ', x.shape)
-        adj_list = []
-        if self.num_heads ==1:
-            x = torch.relu(self.fc_out(x))
-            x = self.fc_cat(x)
-            adj = entmax_adj(x)
-            adj = adj[:, 0].clone().reshape(self.num_nodes, -1)
-            adj_save = adj.clone().detach()
-        else:
-            for i, attention in enumerate(self.att_block):
-                adj= attention(x)
-                adj_list.append(adj)
-                # print('adj shape is: ', adj.shape)
-            adj = torch.stack(adj_list, dim =1)
-            adj = torch.squeeze(adj, dim =2)
-            # print('adj shape after stack and squeeze is: ', adj.shape)
-            adj = self.att_fc(adj)
-            adj_save = adj.clone().detach()
-            # adj = unity(adj)
-            adj = adj.clone().reshape(self.num_nodes, -1)
-        if self.num_nodes < 1600:
-            mask = torch.eye(self.num_nodes, self.num_nodes).bool().to(device)
-            adj.masked_fill_(mask, 0)
-        # print(inputs.shape)
-        # print('start encoding')
-        encoder_hidden_state = self.encoder(inputs, adj, self.node_index)
-        self._logger.debug("Encoder complete, starting decoder")
-        # print('start decoding')
-        outputs = self.decoder(encoder_hidden_state, adj,self.node_index, labels, batches_seen=batches_seen)
-        # self.node_index = torch.unsqueeze(self.node_index, 0)
-        # self.node_index = torch.repeat_interleave(self.node_index, self.num_nodes, 0)
-        # self._logger.debug("Decoder complete")
-        if batches_seen == 0:
-            self._logger.info(
-                "Total trainable parameters {}".format(count_parameters(self))
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        node_feas: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        batches_seen: Optional[int] = None,
+        batch_idx: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if inputs.dim() != 3:
+            raise ValueError(
+                f"inputs must be (seq_len, batch, num_nodes*input_dim) but got {inputs.shape}"
+            )
+        if node_feas.dim() != 2:
+            raise ValueError(
+                f"node_feas must be (num_nodes, node_feat_dim) but got {node_feas.shape}"
+            )
+        if node_feas.size(0) != self.num_nodes:
+            raise ValueError(
+                f"node_feas first dim {node_feas.size(0)} != num_nodes {self.num_nodes}"
             )
 
-        return outputs, x.softmax(-1)[:, 0].clone().reshape(self.num_nodes, -1), adj_save
+        device = inputs.device
+        node_feas = node_feas.to(device)
+        neighbor_index = self.node_index.to(device)
+        neighbor_index_local = None
+        neighbor_index_global = None
+        if self.multi_scale:
+            neighbor_index_local = self.node_index_local.to(device)
+            neighbor_index_global = self.node_index_global.to(device)
+
+        x_seq = self._reshape_inputs(inputs)  # (batch, seq_len, num_nodes, input_dim)
+        batch_size, seq_len, _, _ = x_seq.shape
+        self._contrastive_features = None
+
+        node_embed = self.node_mlp(node_feas)  # (num_nodes, emb_dim)
+        neighbor_weights = self._compute_attention(node_embed, neighbor_index)  # (num_nodes, num_neighbors)
+        adj_local = None
+        adj_global = None
+        if self.multi_scale:
+            adj_local = self._compute_attention(node_embed, neighbor_index_local)
+            adj_global = self._compute_attention(node_embed, neighbor_index_global)
+        node_hidden = self.node_hidden_proj(node_embed)  # (num_nodes, hidden_dim)
+
+        if self.training:
+            if self.temporal_dropout_p > 0:
+                time_mask = torch.rand((batch_size, seq_len, 1, 1), device=device) >= self.temporal_dropout_p
+                x_seq = x_seq * time_mask
+            if self.node_dropout_p > 0:
+                node_mask = torch.rand((batch_size, 1, self.num_nodes, 1), device=device) >= self.node_dropout_p
+                x_seq = x_seq * node_mask
+            if self.multi_scale:
+                with torch.no_grad():
+                    self.adj_ema_local.mul_(self.adj_ema_decay).add_((1 - self.adj_ema_decay) * adj_local.detach())
+                    self.adj_ema_global.mul_(self.adj_ema_decay).add_((1 - self.adj_ema_decay) * adj_global.detach())
+                adj_local = self.adj_ema_mix * adj_local + (1 - self.adj_ema_mix) * self.adj_ema_local
+                adj_global = self.adj_ema_mix * adj_global + (1 - self.adj_ema_mix) * self.adj_ema_global
+
+        # Vectorized spatial encoding over all time steps to avoid Python loops.
+        x_proj = self.input_proj(x_seq)  # (batch, seq_len, num_nodes, hidden_dim)
+        node_embed_expanded = node_hidden.view(1, 1, self.num_nodes, self.hidden_dim)
+        fused_input = x_proj + node_embed_expanded  # broadcast static embeddings
+        fused_flat = fused_input.reshape(batch_size * seq_len, self.num_nodes, self.hidden_dim)
+
+        if self.multi_scale:
+            base_res = self.res_proj(fused_flat)
+            h_local = None
+            h_global = None
+            if self.use_local:
+                h_local = self.sage(fused_flat, neighbor_index_local, adj_local)
+            if self.use_global:
+                h_global = self.sage(fused_flat, neighbor_index_global, adj_global)
+            if h_local is None:
+                h_flat = base_res + h_global
+            elif h_global is None:
+                h_flat = base_res + h_local
+            else:
+                gate = torch.sigmoid(self.gate_mlp(fused_flat))
+                if gate.shape[-1] == 1:
+                    gate = gate.expand_as(h_local)
+                h_fused = gate * h_local + (1 - gate) * h_global
+                h_flat = base_res + h_fused
+        else:
+            h_flat = self.sage(fused_flat, neighbor_index, neighbor_weights)  # (batch*seq, num_nodes, hidden_dim)
+
+        spatial_stack = h_flat.reshape(batch_size, seq_len, self.num_nodes, self.hidden_dim)
+
+        # TCN expects (batch*num_nodes, hidden_dim, seq_len)
+        tcn_in = spatial_stack.permute(0, 2, 3, 1).contiguous()
+        tcn_in = tcn_in.reshape(batch_size * self.num_nodes, self.hidden_dim, seq_len)
+        tcn_out = self.temporal_net(tcn_in)
+        tcn_out = tcn_out.reshape(batch_size, self.num_nodes, self.hidden_dim, seq_len)
+        tcn_out = tcn_out.permute(0, 3, 1, 2).contiguous()  # (batch, seq_len, num_nodes, hidden_dim)
+        self._contrastive_features = tcn_out.mean(dim=1)  # (batch, num_nodes, hidden_dim)
+
+        last_hidden = tcn_out[:, -1, :, :]  # (batch, num_nodes, hidden_dim)
+        logits = self.output_head(last_hidden)  # (batch, num_nodes, horizon*output_dim)
+        logits = logits.reshape(batch_size, self.num_nodes, self.horizon, self.output_dim)
+        logits = logits.permute(2, 0, 1, 3).contiguous()
+        outputs = logits.reshape(self.horizon, batch_size, self.num_nodes * self.output_dim)
+
+        if self.multi_scale:
+            adj_save = {"local": adj_local, "global": adj_global}
+        else:
+            adj_save = neighbor_weights
+        mid_output = spatial_stack
+        if batches_seen == 0:
+            total_params = sum(p.numel() for p in self.parameters())
+            self._logger.info(
+                "SAGDFNModel params: hidden_dim=%d, neighbors=%d, total_params=%d"
+                % (self.hidden_dim, self.num_neighbors, total_params)
+            )
+
+        return outputs, mid_output, adj_save
+
+    def get_contrastive_features(self) -> Optional[torch.Tensor]:
+        """Return pooled TCN features for optional contrastive losses. Shape: (batch, num_nodes, hidden_dim)."""
+        return self._contrastive_features
